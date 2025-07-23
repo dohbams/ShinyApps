@@ -1,0 +1,1148 @@
+---
+title: "Petroleum Products Price Watch"
+author: "by Daniel B."
+output: 
+  flexdashboard::flex_dashboard:
+    navbar:
+      - { title: "<i class='fa fa-table'></i> Data from NBS", align: right, href: "https://www.nigerianstat.gov.ng/" }
+      - { icon: "fab fa-twitter", href: "https://twitter.com/DOh_Bams", align: right }
+      - { icon: "fa-user", href: "https://www.linkedin.com/in/daniel-ohinoyi-bamidele", align: right } 
+    vertical_layout: fill
+    orientation: rows
+    theme:
+     version: 4
+     smart: false
+runtime: shiny
+---
+
+```{=html}
+<style type="text/css">
+
+.rt-bordered .rt-table, .rt-outlined .rt-table {
+    border-style: solid;
+    border-top-left-radius: 1.25rem;
+
+}
+
+
+h4, .h4 {
+font-size: 14px;
+}
+
+.chart-wrapper .chart-stage {
+color: "#FFFFFF";
+padding: 0px;
+
+}
+
+.navbar.navbar-inverse {
+background-color: #000000 !important;
+border-bottom-right-radius: 5.25rem;
+
+}
+
+.navbar-brand, .navbar.navbar-inverse .navbar-brand {
+color: white !important;
+}
+
+.navbar-brand:hover, .navbar.navbar-inverse .navbar-brand:hover {
+color: white !important;
+}
+
+.navbar-brand, .navbar.navbar-inverse .navbar-brand {
+color: white;
+}
+
+.navbar.navbar-inverse ul.nav.navbar-nav>li {
+color: #fff;
+font-size: 16px;
+font-family: "TT Norms Pro Black" ;
+
+}
+
+.nav-tabs-custom > .nav-tabs {
+margin: 0;
+border-bottom: 1px solid #000000;
+color: white
+border-top-right-radius: 10px;
+border-top-left-radius: 3px;
+font-family: "Tw Cen MT",
+}
+
+.chart-wrapper, .nav-tabs-custom, .sbframe-commentary {
+background: #FFFFFF;
+border: 0px solid #B2B2B2;
+border-radius: 0.25rem;
+margin-bottom: 8px;
+margin-right: 8px;
+}
+
+.navbar-brand, .navbar.navbar-inverse .navbar-brand {
+color: black;
+}
+
+.navbar-brand {
+font-family: "TT Norms Pro Medium" ;
+font-size: 24px;
+padding: 0px;
+}
+
+.section.sidebar {
+font-family: "TT Norms Pro" ;
+font-size: 14x;
+background-color: #000000 !important;
+color: white;
+padding: 0px;
+border: 3px solid #ffffff;
+position: fixed;
+top: 62px;
+left: 0;
+bottom: 0;
+border-right: 1px solid #dee2e6;
+background-color: rgba(39, 128, 227, 0.1);
+padding-top: 10px;
+padding-left: 10px;
+padding-right: 10px;
+visibility: hidden;
+border-top-right-radius: 2.25rem;
+border-bottom-right-radius: 2.25rem;
+overflow: fixed;
+}
+
+.chart-title {  /* chart_title  */
+font-size: 12px;
+font-family: TT Norms Pro;
+text-align:center;
+border-color: white;
+background-color: white;
+padding: 0px;}
+
+</style>
+
+```
+
+```{r include=FALSE}
+# Lines 21 to 41 of this document spells out custom styling for elements of the dash board like the side bar etc.
+
+library(DBI)
+library(glue)
+library(RSQLite)
+library(janitor)
+library(lubridate)
+library(httr)
+library(flexdashboard)
+library(tidyverse)
+library(reactable)
+library(reactablefmtr)
+library(htmltools)
+library(plotly)
+library(sparkline)
+library(tidyr)
+library(cowplot)
+library(ggtext)
+library(grid)
+library(extrafont)
+library(extrafontdb)
+library(systemfonts)
+library(sysfonts)
+
+# Function to extract and process data from a specific table
+extract_data <- function(con, table_name, product_type) {
+  dbGetQuery(con, paste("SELECT * FROM", table_name)) %>%
+    janitor::clean_names() %>%
+    dplyr::mutate(
+      product_type = product_type,
+      date = ymd(date),
+      year = year(date),
+      month = month(date, label = TRUE, abbr = FALSE)
+    )
+}
+
+# Main function to process and prepare data from local database
+prepare_data <- function(local_db_path) {
+  # Check if database exists locally
+  if (!file.exists(local_db_path)) {
+    stop(paste("Database file not found at:", local_db_path))
+  }
+  
+  # Connect to the SQLite database
+  con <- dbConnect(SQLite(), local_db_path)
+  on.exit(dbDisconnect(con), add = TRUE)
+  
+  # Extract data from the tables
+  pet_data <- extract_data(con, "pet", "PMS")
+  dies_data <- extract_data(con, "dies", "Diesel")
+  ker_data <- extract_data(con, "ker", "Kerosene")
+  gas_data <- extract_data(con, "gas", "Cooking Gas")
+  
+  # Combine all data
+  full_db_df <- dplyr::bind_rows(pet_data, dies_data, ker_data, gas_data) %>%
+    mutate(
+      price2 = ifelse(product_type == "Cooking Gas", price / 12.5, price),
+      state = ifelse(state == "Nassarawa", "Nasarawa", state),
+      product_type = factor(product_type, levels = c("PMS", "Diesel", "Cooking Gas", "Kerosene"))
+    ) %>% 
+    arrange(state)
+  
+  # Get the latest date for calculations
+  cur_date <- max(full_db_df$date, na.rm = TRUE)
+  prev_month <- cur_date %m-% months(1)
+  prev_year <- cur_date %m-% years(1)
+  
+  # Prepare the summary
+  full_summary <- full_db_df %>%
+    group_by(product_type, state) %>%
+    mutate(
+      cur_date = cur_date,
+      prev_month = prev_month,
+      prev_year = prev_year,
+      prev_month_price = price2[match(prev_month, date)],
+      prev_year_price = price2[match(prev_year, date)]
+    ) %>%
+    filter(date == cur_date) %>%  # Filter for the current date
+    mutate(
+      MoM_percent = ((price2 - prev_month_price) / prev_month_price) * 100,
+      YoY_percent = ((price2 - prev_year_price) / prev_year_price) * 100,
+      MoM_label = ifelse(
+        is.na(MoM_percent), "No Data",
+        paste0(ifelse(MoM_percent > 0, "\u2191", "\u2193"), abs(round(MoM_percent, 2)), "%")
+      ),
+      YoY_label = ifelse(
+        is.na(YoY_percent), "No Data",
+        paste0(ifelse(YoY_percent > 0, "\u2191", "\u2193"), abs(round(YoY_percent, 2)), "%")
+      )
+    ) %>%
+    ungroup()
+  
+  list(full_db_df = full_db_df, full_summary = full_summary)
+}
+
+# Usage Example
+local_db_path <- "products.db"  # Path to your local database
+
+# Call the function to prepare the data from local database
+result <- prepare_data(local_db_path)
+
+# Access the processed data and summary
+full_db_df <- result$full_db_df
+full_summary <- result$full_summary
+
+# Load the state layer (GeoPackage)
+state <- sf::st_read("state.gpkg", quiet = TRUE)
+state <- janitor::clean_names(state)
+
+state_price <- shiny::reactive({
+  state %>%
+    left_join(
+      full_summary %>% filter(product_type == input$product_type),
+      by = join_by(statename == state)
+    )
+})
+
+options(scipen = 999)             # Modify global options in R
+
+# extrafont::loadfonts()
+
+
+```
+
+
+Price Overview {data-orientation=rows}
+=====================================
+
+Sidebar {.sidebar data-width=160}
+----------------------------------
+
+```{r}
+selectInput(inputId = "product_type", label = h4("Product Type"), 
+            choices = c("PMS", "Diesel", "Cooking Gas", "Kerosene"),
+            selected = c("PMS"))
+
+valueBox(
+  value = tags$h6(
+    glue("Latest data is from {format(max(full_db_df$date), '%B %Y')}"),
+    style = "text-align: justify; 
+             font-family: 'TT Norms Pro Medium';
+             font-size: 14px; 
+             color: white; 
+             font-weight: bold;"
+  ),
+  color = "#FFFFFF"
+)
+
+
+```
+
+
+Row {data-height="500"}
+----------------------------------
+
+### <font style="font-family: Tw Cen MT" ></font>
+
+```{r, fig.width=1.5}
+
+renderUI({
+  # Ensure input$product_type is available
+  req(input$product_type)
+  
+  # Data Preparation
+  latest_date <- max(full_db_df$date)
+  current_avg <- full_db_df %>%
+    filter(date == latest_date, product_type == input$product_type) %>%
+    summarise(av_price = mean(price2, na.rm = TRUE)) %>%
+    pull(av_price)
+  
+  past_avg <- full_db_df %>%
+    filter(date == (latest_date %m-% years(1)), product_type == input$product_type) %>%
+    summarise(av_price = mean(price2, na.rm = TRUE)) %>%
+    pull(av_price)
+  
+  percent_change <- (current_avg - past_avg) / past_avg * 100
+  change_color <- ifelse(percent_change > 0, "green", "red")
+  arrow <- ifelse(percent_change > 0, "\u2191", "\u2193")
+  
+  # Define product colors
+  product_colors <- list(
+    "PMS" = "#058003" , 
+    "Diesel" = "#9c6905",
+    "Kerosene" = "#050396" ,
+    "Cooking Gas" = "#db045e")
+
+  # Get the color for the selected product type
+  product_color <- product_colors[input$product_type]
+  
+  # Create the info text with dynamic color
+  info_text <- paste0(
+    "<div style='text-align:center;'>",
+    "<span style='font-size:22px; font-weight:bold;font-family: Tw Cen MT;'>NGN ", round(current_avg, 0), "</span><br>",
+    "<span style='font-size:14px; color:", product_color, ";font-family: Tw Cen MT;'>vs PY </span>",
+    "<span style='font-size:14px; color:", change_color, ";font-family: Tw Cen MT;'>", arrow, " ", round(abs(percent_change), 1), "%</span>",
+    "</div>"
+  )
+  
+  # Determine the unit based on the selected product_type
+  unit <- if (input$product_type %in% c("PMS", "Diesel", "Kerosene")) {
+    "Price/Liter"
+  } else {
+    "Price/Kg"
+  }
+  
+  # Create the title text
+  title_text <- paste("National Average", input$product_type, unit)
+  
+  # Render the title and info text
+  htmltools::div(
+    style = "display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100%; width: 100%; padding: 10px;",
+    htmltools::div(
+      style = "font-size: 24px; font-weight: bold; margin-bottom: 10px; text-align: center;font-family: Tw Cen MT;",
+      title_text
+    ),
+    htmltools::HTML(info_text)
+  )
+})
+
+```
+
+
+### <font style="font-size: 18px ; font-weight:bold; font-family: Tw Cen MT" > </font>
+
+```{r, fig.width=4}
+
+library(highcharter)
+library(shiny)
+library(dplyr)
+library(lubridate)
+
+renderHighchart({
+  
+  # Ensure date is in Date format
+  full_db_df <- full_db_df %>% mutate(date = as.Date(date)) 
+  
+  # Filter data for the last 18 months
+  eighteen_months_ago <- max(full_db_df$date, na.rm = TRUE) - months(12)
+  plot_data <- full_db_df %>%
+    filter(product_type == input$product_type, date >= eighteen_months_ago) %>%
+    mutate(price2 = round(price2, 0)) %>% 
+    group_by(date) %>%
+    summarise(nat_avg_price = mean(price2, na.rm = TRUE), .groups = "drop") %>%
+    mutate(
+      year = year(date),
+      date_ms = as.numeric(as.POSIXct(date)) * 1000  # Convert to milliseconds
+    )
+  
+  # Get highest and lowest points (ensure single values)
+  highest_point <- plot_data %>% filter(nat_avg_price == max(nat_avg_price, na.rm = TRUE))
+  lowest_point <- plot_data %>% filter(nat_avg_price == min(nat_avg_price, na.rm = TRUE))
+  
+  highest_point_ms <- highest_point$date_ms[1]  # Ensure single value
+  lowest_point_ms <- lowest_point$date_ms[1]    # Ensure single value
+  
+  # Define product colors
+  product_colors <- list(
+    "PMS" = "#058003" , 
+    "Diesel" = "#9c6905",
+    "Kerosene" = "#050396" ,
+    "Cooking Gas" = "#db045e")
+
+  # Assign product color (with default fallback)
+  product_color <- product_colors[[input$product_type]] %||% "#000000"
+  
+  # Render Highchart
+  
+  highchart() %>%
+    hc_chart(type = "column") %>%
+    hc_xAxis(
+      type = "datetime",
+      title = list(text = paste0("Price Trend of ", input$product_type,  " Over the Last 12 Months"),
+                   style = list(fontSize = "16px", fontFamily = "Tw Cen MT")),
+      dateTimeLabelFormats = list(month = "%b"), # Use %b for abbreviated month names
+      labels = list(
+        style = list(fontSize = "8px"),
+        formatter = JS("function() {
+        return Highcharts.dateFormat('%b', this.value); // Return three-letter abbrv of the month
+      }")
+      ),
+      tickInterval = 30 * 24 * 3600 * 1000,  # One Month interval
+      gridLineWidth = 0
+    ) %>%
+    hc_yAxis(visible = FALSE, gridLineWidth = 0) %>%
+    hc_add_series(
+      data = list_parse2(plot_data %>% select(date_ms, nat_avg_price)),
+      name = "National Average Price",
+      color = product_color
+    ) %>%
+    hc_xAxis(
+      plotLines = list(
+        list(
+          color = "#a0a0a0",
+          width = 2,
+          dashStyle = "Dash",
+          value = highest_point_ms,
+          label = list(text = "High", verticalAlign = "top", y = -8, 
+                       style = list(color = "red", fontSize = "8px", fontFamily = "Tw Cen MT"))
+        ),
+        list(
+          color = "#a0a0a0",
+          width = 2,
+          dashStyle = "Dash",
+          value = lowest_point_ms,
+          label = list(text = "Low", verticalAlign = "top", y = -8, 
+                       style = list(color = "green", fontSize = "8px", fontFamily = "Tw Cen MT"))
+        )
+      )
+    ) %>%
+    hc_tooltip(
+      useHTML = TRUE,
+      pointFormat = "Price:</b> NGN {point.y:.0f}",
+      backgroundColor = list(
+        linearGradient = c(0, 0, 0, 60),
+        stops = list(
+          list(0, '#FFFFFF'),
+          list(1, '#FFFFFF')
+        )
+      ),
+      borderWidth = 1,
+      borderColor = '#AAA'
+    ) %>%
+    hc_plotOptions(
+      column = list(
+        borderWidth = 0,
+        pointPadding = 0.2,
+        pointWidth = 15,
+        borderRadius = 10
+      ),
+      series = list(marker = list(enabled = FALSE))
+    ) %>%
+    hc_legend(enabled = FALSE) %>%
+    hc_exporting(enabled = FALSE)
+
+
+})
+
+```
+
+### <font style="font-family: Tw Cen MT" ></font> 
+
+```{r, fig.width=1.45}
+
+library(highcharter)
+library(dplyr)
+library(lubridate)
+library(htmltools)
+library(htmlwidgets)
+library(colorspace)  # For generating lighter colors
+
+renderHighchart({
+  
+  # ---- Data Preparation ----
+  
+  # Latest date in the dataset
+  latest_date <- max(full_db_df$date)
+  
+  # National Average Prices: Current and 1 Year Ago
+  current_avg <- full_db_df %>%
+    filter(date == latest_date, product_type == input$product_type) 
+  
+  # Most expensive data
+  most_expensive <- current_avg %>% 
+    arrange(desc(price2)) %>% 
+    mutate(price2 = round(price2, 0)) %>% 
+    head(5)
+  
+  # Define product colors
+  product_colors <- list(
+    "PMS" = "#058003" , 
+    "Diesel" = "#9c6905",
+    "Kerosene" = "#050396" ,
+    "Cooking Gas" = "#db045e")
+  
+  
+  # Get the main color for the selected product type
+  main_color <- product_colors[input$product_type]
+  
+  # Generate a lighter version of the main color
+  lighter_color <- lighten(main_color, amount = 0.87)  # Adjust the `amount` to control lightness
+  
+  # Assign colors based on the highest price
+  most_expensive <- most_expensive %>%
+    mutate(color = ifelse(price2 == max(price2), main_color, lighter_color))
+  
+  # ---- Highcharter Plot ----
+  most_expensive_chart <- highchart() %>%
+    hc_chart(type = "bar") %>%
+    hc_title(text = paste("Top 5 States with the Highest", input$product_type, "Price in Nigeria"),
+             style = list(fontSize = "9pt", fontFamily = "Tw Cen MT", fontWeight = 'bold')) %>%
+    hc_xAxis(categories = most_expensive$state, title = list(text = NULL),
+             labels = list(
+               style = list(fontFamily = "Tw Cen MT", fontSize = "10pt")  # Set font for state labels
+             ),
+             gridLineWidth = 0
+    ) %>% 
+    hc_yAxis(title = list(text = ''), labels = list(enabled = FALSE),
+             gridLineWidth = 0) %>%     # Hide y-axis labels
+    hc_plotOptions(bar = list(
+      colorByPoint = TRUE,  # Assign colors based on the data
+      colors = most_expensive$color  # Use the custom colors
+    )) %>%
+    hc_add_series(name = "Price", data = most_expensive$price2) %>%
+    hc_tooltip(pointFormat = "Price:</b> NGN {point.y}") %>%
+    hc_legend(enabled = FALSE) %>%
+    hc_chart(inverted = TRUE) %>%   # Invert the chart to make it horizontal 
+    hc_plotOptions(
+      bar = list(
+        borderWidth = 0,          # Remove border
+        pointPadding = 0.2,        # Adjust spacing between bars
+        pointWidth = 10,           # Increase bar width (adjust as needed)
+        borderRadius = 10))          # Add rounded corners (adjust as needed)
+  
+  # Return the chart
+  most_expensive_chart
+})
+
+```
+
+### <font style="font-family: Tw Cen MT" ></font> 
+
+```{r, fig.width=1.45}
+
+
+library(highcharter)
+library(dplyr)
+library(lubridate)
+library(htmltools)
+library(htmlwidgets)
+library(colorspace)  # For generating lighter colors
+
+renderHighchart({
+  
+  # ---- Data Preparation ----
+  
+  # Latest date in the dataset
+  latest_date <- max(full_db_df$date)
+  
+  # National Average Prices: Current and 1 Year Ago
+  current_avg <- full_db_df %>%
+    filter(date == latest_date, product_type == input$product_type)
+  
+  # Least expensive data
+  least_expensive <- current_avg %>%
+    arrange(price2) %>%  # Sort in ascending order for least expensive
+    mutate(price2 = round(price2, 0)) %>%
+    head(5)
+  
+  # Define product colors
+  product_colors <- list(
+    "PMS" = "#058003" , 
+    "Diesel" = "#9c6905",
+    "Kerosene" = "#050396" ,
+    "Cooking Gas" = "#db045e")
+  
+  
+  # Get the main color for the selected product type
+  main_color <- product_colors[input$product_type]
+  
+  # Generate a lighter version of the main color
+  lighter_color <- lighten(main_color, amount = 0.87)  # Adjust the `amount` to control lightness
+  
+  # Assign colors based on the lowest price
+  least_expensive <- least_expensive %>%
+    mutate(color = ifelse(price2 == min(price2), main_color, lighter_color))
+  
+  # ---- Highcharter Plot ----
+  least_expensive_chart <- highchart() %>%
+    hc_chart(type = "bar") %>%
+    hc_title(text = paste("Top 5 States with the Lowest", input$product_type, "Price in Nigeria"),
+             style = list(fontSize = "9pt", fontFamily = "Tw Cen MT", fontWeight = 'bold')) %>%
+    hc_xAxis(
+      categories = least_expensive$state,
+      title = list(text = NULL),
+      labels = list(
+        style = list(fontFamily = "Tw Cen MT", fontSize = "10pt")  # Set font for state labels
+      ),
+      gridLineWidth = 0
+    ) %>%
+    hc_yAxis(title = list(text = ''), labels = list(enabled = FALSE),
+             gridLineWidth = 0) %>%     # Hide y-axis labels
+    hc_plotOptions(bar = list(
+      colorByPoint = TRUE,  # Assign colors based on the data
+      colors = least_expensive$color  # Use the custom colors
+    )) %>%
+    hc_add_series(name = "Price", data = least_expensive$price2) %>%
+    hc_tooltip(pointFormat = "Price:</b> NGN {point.y}") %>%
+    hc_legend(enabled = FALSE) %>%
+    hc_chart(inverted = TRUE) %>%   # Invert the chart to make it horizontal
+    hc_plotOptions(
+      bar = list(
+        borderWidth = 0,          # Remove border
+        pointPadding = 0.2,        # Adjust spacing between bars
+        pointWidth = 10,           # Increase bar width (adjust as needed)
+        borderRadius = 10))          # Add rounded corners (adjust as needed)
+  
+  # Return the chart
+  least_expensive_chart
+})
+
+```
+
+
+Row {data-height=800"}
+----------------------------------
+
+### <font style="font-family: Tw Cen MT" ></font> 
+
+
+```{r, fig.width=3.6}
+
+library(shiny)
+library(sf)
+library(dplyr)
+library(highcharter)
+library(colorspace)
+library(tidyverse)
+library(lubridate)
+
+# Preload map data
+map_data <- highcharter::download_map_data("countries/ng/ng-all")
+
+# Load the state layer (GeoPackage)
+state <- sf::st_read("state.gpkg", quiet = TRUE)
+state <- janitor::clean_names(state)
+
+# Define product colors
+product_colors <- c(
+  "PMS" = "#058003",
+  "Diesel" = "#9c6905",
+  "Kerosene" = "#050396",
+  "Cooking Gas" = "#db045e"
+)
+
+# Preprocess full_summary data
+preprocess_full_summary <- function(full_summary) {
+  full_summary %>%
+    select(state, product_type, price2, YoY_percent, MoM_percent)
+}
+
+# Preprocess the full_summary data
+full_summary2 <- preprocess_full_summary(full_summary)
+
+# Create cached versions of all possible state-product combinations
+# This happens once when the app starts
+cached_state_data <- list()
+
+for (product in unique(full_summary2$product_type)) {
+  full_summary_filtered <- full_summary2 %>% filter(product_type == product)
+  
+  cached_state_data[[product]] <- state %>%
+    left_join(full_summary_filtered, by = c("statename" = "state")) %>%
+    mutate(
+      statename = case_when(
+        statename == "FCT" ~ "Federal Capital Territory",
+        statename == "Nasarawa" ~ "Nassarawa",
+        TRUE ~ statename
+      )
+    )
+}
+
+# Precompute color palettes for each product
+product_palettes <- lapply(product_colors, function(color) {
+  colorRampPalette(c(
+    lighten(color, 0.8),
+    color,
+    darken(color, 0.8)
+  ))(10)
+})
+
+
+# Reactive that returns pre-cached data
+state_data <- reactive({
+  # Get the cached data for this product type
+  data <- cached_state_data[[input$product_type]]
+  
+  # Add the dynamic elements (these are quick to compute)
+  data %>%
+    mutate(
+      change_color = ifelse(YoY_percent > 0, "green", "red"),
+      arrow = ifelse(YoY_percent > 0, "\u2191", "\u2193"),
+      change_color2 = ifelse(MoM_percent > 0, "green", "red"),
+      arrow2 = ifelse(MoM_percent > 0, "\u2191", "\u2193"),
+      info_text = paste0(
+        "<b>", statename, "</b><br/>",
+        "<b>NGN ", round(price2, 0), "</b><br/>",
+        "<span style='color:", product_colors[input$product_type], "'>vs PY </span>",
+        "<span style='color:", change_color, "'>", arrow, " ", round(abs(YoY_percent), 1), "%</span><br/>",
+        "<span style='color:", product_colors[input$product_type], "'>vs PM </span>",
+        "<span style='color:", change_color2, "'>", arrow2, " ", round(abs(MoM_percent), 1), "%</span>"
+      )
+    )
+})
+
+renderHighchart({
+  # Get the current product's color palette
+  palette_colors <- product_palettes[[input$product_type]]
+
+  highchart(type = "map") %>%
+    hc_add_series_map(
+      map = map_data,
+      df = state_data(),
+      joinBy = c("name", "statename"),
+      value = "price2",
+      name = "Price (NGN)",
+      borderColor = "grey5",
+      borderWidth = 1
+    ) %>%
+    hc_colorAxis(
+      stops = color_stops(
+        n = 3,
+        colors = c(palette_colors[1], palette_colors[5], palette_colors[10])
+      ),
+      min = min(state_data()$price2, na.rm = TRUE),
+      max = max(state_data()$price2, na.rm = TRUE),
+      reversed = TRUE
+    ) %>%
+    hc_tooltip(
+      useHTML = TRUE,
+      headerFormat = "",
+      pointFormat = "{point.info_text}",
+      outside = FALSE
+    ) %>%
+    hc_legend(
+      align = "right",
+      verticalAlign = "bottom",
+      layout = "vertical",
+      floating = F,
+      reversed = TRUE
+    ) %>%
+    hc_chart(backgroundColor = "white") %>%
+    hc_subtitle(
+    text = "Hover over the map to get more details.",
+    align = "left",
+    style = list(color = "#000000", fontWeight = "italic", fontSize = "10pt", fontFamily = "Tw Cen MT")
+    )
+})
+
+
+
+```
+
+### <font style="font-family: Tw Cen MT" ></font>
+
+```{r}
+
+renderReactable({
+
+  # Define product colors
+  product_colors <- list(
+    "PMS" = "#058003",
+    "Diesel" = "#9c6905",
+    "Kerosene" = "#050396",
+    "Cooking Gas" = "#db045e"
+  )
+
+  # Get the color and unit for the selected product type
+  selected_color <- as.character(product_colors[input$product_type])
+  lighter_color <- paste0(selected_color, "33") # Add transparency for softer look
+
+  unit <- ifelse(input$product_type == "Cooking Gas", "/Kg", "/Litre")
+
+  # Prepare sample data for the table
+  filtered_summary <- full_summary %>%
+    filter(product_type == input$product_type) %>%
+    select(
+      state, price2, prev_month_price, prev_year_price,
+      MoM_percent, YoY_percent
+    )
+
+  price_trends <- full_db_df %>% arrange(date) %>%
+    filter(product_type == input$product_type) %>%
+    group_by(state) %>%
+    summarize(price_trend = list(price2), .groups = "drop")
+
+  filtered_summary <- filtered_summary %>%
+    left_join(price_trends, by = "state") %>%
+    mutate(
+      bar_chart = price2
+    ) %>%
+    rename(
+      State = state,
+      `Current Price` = price2,
+      `Previous Month Price` = prev_month_price,
+      `Previous Year Price` = prev_year_price
+    ) %>%
+    select(
+      State, `Current Price`, `Previous Month Price`, `Previous Year Price`,
+      MoM_percent, YoY_percent, price_trend
+    )
+
+  reactable(
+    filtered_summary,
+    columns = list(
+      State = colDef(
+        name = "State",
+        sortable = TRUE,
+        minWidth = 150,
+        align = "center",
+        style = list(borderRight = "1px solid rgba(0, 0, 0, 0.1)") # Softer border
+      ),
+      `Current Price` = colDef(
+        name = "Current Price",
+        cell = function(value) {
+          paste0("NGN ", format(round(value, 0), big.mark = ","), unit)
+        },
+        sortable = TRUE,
+        align = "center"
+      ),
+      `Previous Month Price` = colDef(
+        name = "Previous Month Price",
+        cell = function(value) {
+          paste0("NGN ", format(round(value, 0), big.mark = ","), unit)
+        },
+        align = "center"
+      ),
+      `Previous Year Price` = colDef(
+        name = "Previous Year Price",
+        cell = function(value) {
+          paste0("NGN ", format(round(value, 0), big.mark = ","), unit)
+        },
+        align = "center"
+      ),
+      MoM_percent = colDef(
+        name = "MoM",
+        cell = function(value) {
+          if (value >= 0) {
+            htmltools::tags$span(style = "color: #2e7d32;", paste0("↑ ", round(value, 1), "%")) # Softer green
+          } else {
+            htmltools::tags$span(style = "color: #c62828;", paste0("↓ ", abs(round(value, 1)), "%")) # Softer red
+          }
+        },
+        sortable = TRUE,
+        align = "center"
+      ),
+      YoY_percent = colDef(
+        name = "YoY",
+        cell = function(value) {
+          if (value >= 0) {
+            htmltools::tags$span(style = "color: #2e7d32;", paste0("↑ ", round(value, 1), "%")) # Softer green
+          } else {
+            htmltools::tags$span(style = "color: #c62828;", paste0("↓ ", abs(round(value, 1)), "%")) # Softer red
+          }
+        },
+        sortable = TRUE,
+        align = "center"
+      ),
+      price_trend = colDef(
+        name = "Price Trend",
+        cell = function(value, index) {
+          sparkline(
+            filtered_summary$price_trend[[index]],
+            type = "line",
+            lineColor = selected_color,
+            lineWidth = 1.2,
+            fillColor = "#fafafa", # Lighter fill
+            minSpotColor = "#c62828", # Softer red
+            maxSpotColor = "#2e7d32", # Softer green
+            spotColor = "#6a1b9a", # Softer purple
+            disableInteraction = TRUE
+          )
+        },
+        align = "center"
+      )
+    ),
+    defaultSorted = "State",
+    bordered = TRUE,
+    highlight = TRUE,
+    compact = TRUE,
+    resizable = TRUE,
+    searchable = TRUE,
+    defaultPageSize = 37,
+    theme = reactableTheme(
+      headerStyle = list(
+        backgroundColor = selected_color,
+        color = "white",
+        fontWeight = "500", # Slightly lighter font weight
+        fontFamily = "Tw Cen MT",
+        fontSize = "12px",
+        borderColor = "rgba(255, 255, 255, 0.3)" # Softer border
+
+      ),
+      cellStyle = list(
+        fontFamily = "Tw Cen MT",
+        fontSize = "12px",
+        borderColor = "rgba(0, 0, 0, 0.08)" # Softer cell borders
+      ),
+      backgroundColor = "#ffffff", # Pure white background
+      borderColor = "rgba(0, 0, 0, 0.1)", # Softer table border
+      style = list(
+        fontFamily = "Tw Cen MT",
+        color = "#000000" # Softer text color
+      )
+    )
+
+  )
+})
+
+```
+
+
+State Report Card {data-orientation=rows}
+=========================================
+
+Sidebar {.sidebar data-width=200} 
+----------------------------------
+
+```{r}
+
+
+selectInput(inputId = "state_name", label = h4("Select State"), 
+            choices = full_summary %>% dplyr::arrange(state) %>% dplyr::pull(state) %>% unique(),
+            selected = c("Abia"))
+
+valueBox(
+  value = tags$h6(
+    glue("Latest data is from {format(max(full_db_df$date), '%B %Y')}"),
+    style = "text-align: justify; 
+             font-family: 'TT Norms Pro Medium';
+             font-size: 14px; 
+             color: white; 
+             font-weight: bold;"
+  ),
+  color = "#FFFFFF"
+)
+
+```
+
+
+
+
+```{r setup, include=FALSE}
+
+library(tidyverse)
+library(extrafont)
+extrafont::loadfonts()
+
+# Define product colors
+product_colors <- c(
+  "PMS" = "#058003", 
+  "Diesel" = "#9c6905",
+  "Kerosene" = "#050396",
+  "Cooking Gas" = "#db045e"
+)
+
+# Filter data to last x months
+x = 12
+x_months_ago <- max(full_db_df$date) %m-% months(x)
+full_db_df <- full_db_df %>% filter(date >= x_months_ago)
+full_summary <- full_summary %>% filter(date >= x_months_ago)
+
+plot_with_legend <- ggplot(full_db_df %>% filter(state == "Lagos"), aes(x = date, y = price2)) +
+  geom_line(aes(color = product_type), linewidth = 3) +
+  scale_color_manual(values = product_colors, name = "Product Type", 
+                     guide = guide_legend(nrow = 1, label.position = "top", keywidth = unit(3, "cm"))) +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        legend.title.position = "top",
+        legend.title = element_text(size = 14, face = "bold", hjust = 0.5, family = "Tw Cen MT"),
+        legend.text = element_text(size = 12, face = "bold", family = "Tw Cen MT"))
+
+legend <- ggpubr::as_ggplot(ggpubr::get_legend(plot_with_legend))
+
+# Function to create a plot for the state name
+generate_state_name_plot <- function(state_name) {
+  ggplot() +
+    geom_text(
+      aes(x = 0.5, y = 0.5, label = state_name), 
+      size = 25, fontface = "bold", hjust = 0.5, family = "Tw Cen MT"
+    ) +
+    theme_void() +
+    theme(
+      plot.margin = ggplot2::margin(10, 10, 10, 10, unit = "pt"),
+      plot.background = element_rect(fill = "white", color = NA)
+    )
+}
+
+# Function to create a summary table for each state
+generate_ggplot_table <- function(data, state_name, product_colors) {
+  
+  table_data <- data %>%
+    mutate(
+      product_type = factor(product_type, levels = c("PMS", "Diesel", "Cooking Gas", "Kerosene")),
+      numeric_price = as.numeric(price2),
+      unit = ifelse(product_type == "Cooking Gas", "/Kg", "/Litre"),
+      price2 = paste0("NGN ", format(round(price2, 0), nsmall = 0), unit),
+      MoM_color = ifelse(grepl("↑", MoM_label), "green", 
+                         ifelse(grepl("↓", MoM_label), "red", "black")),
+      YoY_color = ifelse(grepl("↑", YoY_label), "green", 
+                         ifelse(grepl("↓", YoY_label), "red", "black"))
+    ) %>%
+    arrange(desc(product_type)) %>%
+    mutate(row = row_number())
+  
+  column_headers <- tibble(
+    x = c(1, 2, 3, 4),
+    label = c("Product Type", "Price", "MoM", "YoY")
+  )
+  
+  ggplot() +
+    geom_segment(data = table_data, aes(x = 0.5, xend = 5.5, y = row + 0.5, yend = row + 0.5), 
+                 color = "gray4", alpha = 0.6, linewidth = 2, lineend = "round") +
+    geom_label(data = table_data, aes(x = 1, y = row, label = product_type, fill = product_type), 
+               hjust = 0.5, fontface = "bold", size = 5, label.size = 0, family = "Tw Cen MT", color = "white") +
+    geom_text(data = table_data, aes(x = 2, y = row, label = price2), 
+              hjust = 0.5, color = "black", fontface = "bold", size = 5, family = "Tw Cen MT") +
+    geom_text(data = table_data, aes(x = 3, y = row, label = MoM_label, color = MoM_color), 
+              hjust = 0.5, size = 5, family = "Tw Cen MT", fontface = "bold") +
+    geom_text(data = table_data, aes(x = 4, y = row, label = YoY_label, color = YoY_color), 
+              hjust = 0.5, size = 5, family = "Tw Cen MT", fontface = "bold") +
+    geom_text(data = column_headers, aes(x = x, y = max(table_data$row) + 1, label = label), 
+              hjust = 0.5, fontface = "bold", size = 7, family = "Tw Cen MT") +
+    labs(title = glue("Price of Petroleum Products ({format(max(full_db_df$date), '%B %Y')})
+         
+         ")) +
+    theme_void() +
+    theme(
+      plot.title = element_text(size = 16, hjust = 0.5, family = "Tw Cen MT"),
+      legend.position = "none"
+    ) +
+    scale_color_manual(values = c(product_colors, green = "green", red = "red", black = "black")) +
+    scale_fill_manual(values = product_colors, na.value = "white")
+}
+
+# Function to create a line and area plot for each state
+generate_state_plot <- function(data, state_name) {
+  ggplot(data, aes(x = date, y = price2)) +
+    geom_line(aes(color = product_type), linewidth = 3, lineend = "round") +
+    geom_area(aes(fill = product_type), alpha = 0.7) +
+    facet_wrap(~ product_type, ncol = 1, strip.position = "top", scales = "fixed") +
+    scale_color_manual(
+      values = product_colors,
+      name = "Product Type", 
+      guide = guide_legend(nrow = 1)
+    ) +
+    scale_fill_manual(
+      values = product_colors,
+      guide = "none"
+    ) +
+    scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") + # Adjusted for month-year view
+    scale_y_continuous(labels = NULL, position = "right") +
+    theme_minimal(base_size = 14) +
+    theme(
+      panel.grid = element_blank(),
+      axis.title = element_blank(),
+      axis.text.x = element_text(size = 14, color = "#666666", family = "Tw Cen MT", face = "bold"),
+      axis.text.y = element_blank(),
+      panel.spacing = unit(0.25, "lines"),
+      legend.position = "none",
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_blank(),
+      strip.text = element_blank()) +
+    theme(
+      plot.margin = ggplot2::margin(0, 20, 0, 20, unit = "pt")
+    )
+}
+
+# Function to create a border around each state card
+add_border <- function(plot, border_color = "black", border_size = 7) { 
+  ggdraw() +
+    draw_plot(plot) +
+    theme_void() +
+    theme(
+      plot.margin = ggplot2::margin(30, 30, 30, 30, unit = "pt")
+    ) +
+    draw_grob(
+      grid::rectGrob(
+        gp = grid::gpar(
+          col = border_color,
+          lwd = border_size,
+          fill = NA
+        )
+      )
+    )
+}
+
+# Function to combine the plots inside a card for each state
+combine_state_card <- function(state_name, full_summary, full_db_df, product_colors) {
+  state_name_plot <- generate_state_name_plot(state_name)
+  table_plot <- generate_ggplot_table(full_summary %>% filter(state == state_name), state_name, product_colors)
+  line_plot <- generate_state_plot(full_db_df %>% filter(state == state_name), state_name)
+  
+  state_and_table <- plot_grid(
+    state_name_plot, table_plot,
+    ncol = 1,
+    rel_heights = c(0.5, 1)
+  )
+  
+  combined_with_line <- ggdraw() +
+    draw_plot(state_and_table, x = 0, y = 0.05, width = 0.5, height = 1) +
+    draw_plot(line_plot, x = 0.5, y = 0.05, width = 0.5, height = 1) +
+    draw_plot(legend, x = 0.5, y = -0.05, width = 0.07, height = 0.05, scale = 0.1) +
+    draw_grob(
+      grid::linesGrob(
+        x = unit(c(0.52, 0.52), "npc"),
+        y = unit(c(0.1, 0.9), "npc"),
+        gp = grid::gpar(col = "gray25", lwd = 4, lineend = 'round')
+      )
+    ) + 
+    theme(plot.margin = ggplot2::margin(30, 10, 70, 30, unit = "pt"))
+  
+  bordered_card <- add_border(combined_with_line)
+  
+  return(bordered_card)
+}
+
+
+```
+
+
+Row
+----------------------------------
+
+### <font style="font-family: Tw Cen MT" ></font> 
+
+```{r}
+
+library(extrafont)
+renderPlot({
+  req(input$state_name)
+  combine_state_card(input$state_name, full_summary, full_db_df, product_colors)
+})
+
+```
